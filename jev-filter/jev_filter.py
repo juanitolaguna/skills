@@ -15,8 +15,9 @@ Three stages, cheapest first, so the expensive reader only sees what survives:
               under OUT/judge/<criteria-hash>/; subagents read the files, follow judge.md
               and write a verdicts file next to each queue; the next run reads them back.
 
-Jev answers are cached by (content hash, model, criteria, question version) and
-judge verdicts by (content hash, criteria), so a rerun pays only for what is new.
+Every cache is keyed by what its reader read: Jev answers by the state Jev was sent (with model,
+criteria and question version), judge verdicts by the text the judge read (and criteria), so a rerun
+pays only for what is new, and an extraction fix re-asks only what it changed.
 
 Python:   jev_filter(criteria="...", root=Path(...), out=Path(...))
 CLI:      jev_filter.py ROOT --criteria "..." --out DIR [--dry-run] [--limit N]
@@ -40,7 +41,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 
 JEV_MODEL = "~typesafe/jev-latest"              # $0.042/M in, output free, 32k context
@@ -49,6 +50,7 @@ DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"
 KEY_FILE = ".openrouter_jev"
 
 TEXT_EXT = {".md", ".markdown", ".txt", ".docx", ".pdf", ".epub", ".html", ".htm"}
+SOURCE_IS_TEXT = {".md", ".markdown", ".txt"}     # the judge and the corpus read these files as they are
 
 # Criteria-independent questions: their answers describe the file, whatever is being looked for.
 JEV_KIND = {
@@ -127,12 +129,12 @@ def _pdf(path: Path, max_pages: int | None = 6) -> tuple[str, int]:
     return "\n\n[...]\n\n".join(p for p in parts if p.strip()), n
 
 
-def _epub(path: Path, limit: int = 40000) -> str:
-    out = []
+def _epub(path: Path, limit: int | None = 40000) -> str:
+    out: list[str] = []
     with zipfile.ZipFile(path) as z:
         for name in sorted(n for n in z.namelist() if n.endswith((".xhtml", ".html", ".htm"))):
             out.append(_strip_html(z.read(name).decode("utf8", "ignore")))
-            if sum(map(len, out)) > limit:
+            if limit is not None and sum(map(len, out)) > limit:
                 break
     return "\n\n".join(out)
 
@@ -160,6 +162,76 @@ def extract(path: Path) -> tuple[str, dict]:
         extra["error"] = f"{type(e).__name__}: {e}"[:200]
         text = ""
     return text, extra
+
+
+@dataclass
+class SourceDoc:
+    """One file under the scanned folder. Every reader asks it for its text: local rules and Jev the cheap
+    view, made when it is read; the judge and the corpus the full text, extracted on first ask."""
+    rel: str
+    path: Path
+    ext: str
+    id: str                  # SHA-256 of the source bytes: the public id
+    text: str = field(repr=False)   # the cheap view: stripped markdown, a PDF sample; local rules and Jev read it
+    text_sha: str = ""       # SHA-256 of `text`, whitespace collapsed: two files with the same words are duplicates
+    features: dict = field(default_factory=dict)
+    pages: int | None = None
+    error: str = ""          # why nothing is readable; text and full text are then ''
+    _full: str | None = field(default=None, repr=False)
+    _full_sha: str | None = field(default=None, repr=False)
+
+    @classmethod
+    def read(cls, root: Path, path: Path) -> SourceDoc:
+        """Never raises: an unreadable file comes back with `error` set."""
+        ext = path.suffix.lower()
+        extra: dict
+        source: bytes | None
+        try:
+            source = path.read_bytes()
+        except OSError as e:
+            source, text, extra = None, "", {"error": f"{type(e).__name__}: {e}"[:200]}
+        else:
+            text, extra = extract(path)
+        raw = source.decode("utf8", "ignore") if source is not None and ext in SOURCE_IS_TEXT else text
+        return cls(rel=path.relative_to(root).as_posix(), path=path, ext=ext,
+                   id="" if source is None else hashlib.sha256(source).hexdigest(), text=text,
+                   text_sha=hashlib.sha256(" ".join(text.split()).encode()).hexdigest(),
+                   features=features(raw, text), pages=extra.get("pages"), error=extra.get("error", ""))
+
+    def excerpt(self, budget: int) -> str:
+        """What Jev reads of the cheap view."""
+        return excerpt(self.text, budget)
+
+    def full_text(self) -> str:
+        """The whole document, as the judge reads it and the corpus stores it; extracted on first ask."""
+        if self._full is None:
+            if self.error:
+                self._full = ""
+            elif self.ext in SOURCE_IS_TEXT:
+                self._full = self.path.read_text(encoding="utf-8", errors="replace")
+            elif self.ext == ".pdf":
+                self._full = _pdf(self.path, max_pages=None)[0]
+            elif self.ext == ".epub":
+                self._full = _epub(self.path, limit=None)
+            else:  # DOCX, HTML: the extraction is already whole
+                self._full = self.text
+        return self._full
+
+    @property
+    def full_sha(self) -> str:
+        """SHA-256 of the full text: the judge's verdict is filed under what the judge read."""
+        if self._full_sha is None:
+            self._full_sha = hashlib.sha256(self.full_text().encode()).hexdigest()
+        return self._full_sha
+
+    def judge_path(self, text_dir: Path) -> Path:
+        """The file the judge opens: the source itself when it is text, else the full text written to `text_dir`."""
+        if self.ext in SOURCE_IS_TEXT:
+            return self.path
+        text_dir.mkdir(parents=True, exist_ok=True)
+        path = text_dir / f"{self.full_sha[:16]}.md"
+        path.write_text(self.full_text(), encoding="utf-8")
+        return path
 
 
 # ---------------------------------------------------------------- features
@@ -295,17 +367,17 @@ class Cache:
 # ---------------------------------------------------------------- pipeline
 
 @dataclass
-class Doc:
-    rel: str
-    ext: str
-    sha: str = ""
-    feats: dict = field(default_factory=dict)
-    extra: dict = field(default_factory=dict)
-    text: str = field(default="", repr=False)
+class Case:
+    """One source document's passage through the pipeline: the evidence each stage left and the outcome."""
+    source: SourceDoc
     stage: str = ""          # local | jev | judge | override (+cache)
-    decision: str = ""       # keep | drop | error
+    decision: str = ""       # keep | drop | dup | error | pending
     why: str = ""
     verdict: dict = field(default_factory=dict)
+
+    @property
+    def rel(self) -> str:
+        return self.source.rel
 
 
 def discover(root: Path, include: list[str], exclude: list[str]) -> list[Path]:
@@ -325,12 +397,12 @@ def discover(root: Path, include: list[str], exclude: list[str]) -> list[Path]:
     return out
 
 
-def jev_state(d: Doc, budget: int) -> dict:
-    f = dict(d.feats)
-    if d.extra.get("pages"):
-        f["pdf_pages"] = d.extra["pages"]
-    state = {"path": d.rel, "features": f, "excerpt": excerpt(d.text, budget)}
-    if ".assets/" in d.rel:
+def jev_state(src: SourceDoc, budget: int) -> dict:
+    f = dict(src.features)
+    if src.pages:
+        f["pdf_pages"] = src.pages
+    state = {"path": src.rel, "features": f, "excerpt": src.excerpt(budget)}
+    if ".assets/" in src.rel:
         state["note"] = "attachment stored next to a note, often downloaded material"
     return state
 
@@ -343,7 +415,7 @@ def jev_filter(criteria: str, root: Path, out: Path, *,
                limit: int | None = None, sample: int | None = None,
                drop_clips: bool = True, trust_jev: bool = False, overrides: Path | None = None,
                budget_usd: float = 0.5, workers: int = 8, dry_run: bool = False, fresh_jev: bool = False,
-               copy_selected: bool = True, log=None) -> list[Doc]:
+               copy_selected: bool = True, log=None) -> list[Case]:
     """Sort every readable document under `root` by `criteria`; write verdicts, a report, the judge queue
     and the kept texts to `out`. Run again after the judge has written its verdicts."""
     log = log or (lambda *a: print(*a, flush=True))
@@ -358,68 +430,65 @@ def jev_filter(criteria: str, root: Path, out: Path, *,
         paths = paths[:limit]
     log(f"[0] {len(paths)} candidate files under {root}")
 
-    docs: list[Doc] = []
-    seen: dict[str, Doc] = {}
+    cases: list[Case] = []
+    seen: dict[str, Case] = {}
     for p in paths:
-        rel = p.relative_to(root).as_posix()
-        d = Doc(rel=rel, ext=p.suffix.lower())
-        d.text, d.extra = extract(p)
-        raw = p.read_text("utf8", "ignore") if d.ext in (".md", ".txt", ".markdown") else d.text
-        d.feats = features(raw, d.text)
-        d.sha = hashlib.sha256(d.text.encode()).hexdigest()
-        docs.append(d)
-        if d.extra.get("error"):
-            d.stage, d.decision, d.why = "local", "error", d.extra["error"]
-        elif d.feats["words"] < min_words:
-            d.stage, d.decision, d.why = "local", "drop", f"too short ({d.feats['words']} words < {min_words})"
-        elif drop_clips and d.feats["clip_header"]:
-            d.stage, d.decision, d.why = "local", "drop", "web clip (Site/Author/Saved header)"
-        elif d.sha in seen:
-            d.stage, d.decision, d.why = "local", "dup", f"duplicate of {seen[d.sha].rel}"
+        case = Case(SourceDoc.read(root, p))
+        src = case.source
+        cases.append(case)
+        if src.error:
+            case.stage, case.decision, case.why = "local", "error", src.error
+        elif src.features["words"] < min_words:
+            case.stage, case.decision, case.why = "local", "drop", f"too short ({src.features['words']} words < {min_words})"
+        elif drop_clips and src.features["clip_header"]:
+            case.stage, case.decision, case.why = "local", "drop", "web clip (Site/Author/Saved header)"
+        elif src.text_sha in seen:
+            case.stage, case.decision, case.why = "local", "dup", f"duplicate of {seen[src.text_sha].rel}"
         else:
-            seen[d.sha] = d
-    todo = [d for d in docs if not d.decision]
+            seen[src.text_sha] = case
+    todo = [case for case in cases if not case.decision]
     # measured on the Studies run: 1.84 chars per Jev input token (mixed Cyrillic/Latin), plus ~150 for the questions
-    jev_tok = int(sum(len(excerpt(d.text, jev_chars)) for d in todo) / 1.84) + 150 * len(todo)
-    log(f"[0] local: {len(docs) - len(todo)} settled for free, {len(todo)} go to Jev "
+    jev_tok = int(sum(len(case.source.excerpt(jev_chars)) for case in todo) / 1.84) + 150 * len(todo)
+    log(f"[0] local: {len(cases) - len(todo)} settled for free, {len(todo)} go to Jev "
         f"(~{jev_tok // 1000}k tokens, ~${jev_tok * 0.042e-6:.3f} if nothing is cached)")
     if dry_run:
-        _write_outputs(docs, out, criteria, None, copy_selected=False, root=root)
-        return docs
+        _write_outputs(cases, out, criteria, None, copy_selected=False)
+        return cases
 
     # ---- stage 1: Jev
     api = JevClient(find_key(), budget_usd)
     cache = Cache(out / ".jev_cache.jsonl")
     questions = jev_questions(criteria)
 
-    def ask_jev(d: Doc) -> tuple[dict, bool]:
-        k = Cache.key(JEV_VERSION, jev_model, crit_hash, d.sha, str(jev_chars))
+    def ask_jev(case: Case) -> tuple[dict, bool]:
+        state = jev_state(case.source, jev_chars)
+        k = Cache.key(JEV_VERSION, jev_model, crit_hash, json.dumps(state, sort_keys=True, ensure_ascii=False))
         hit = None if fresh_jev else cache.get(k)
         if hit:
             return hit, True
-        v = api.decide(jev_model, jev_state(d, jev_chars), questions)
+        v = api.decide(jev_model, state, questions)
         cache.put(k, v)
         return v, False
 
     log(f"[1] Jev ({jev_model}) on {len(todo)} files")
     t_stage = time.perf_counter()
-    answers: list[tuple[Doc, dict, bool]] = []
+    answers: list[tuple[Case, dict, bool]] = []
     done = 0
     with ThreadPoolExecutor(workers) as ex:
-        futs = {ex.submit(ask_jev, d): d for d in todo}
+        futs = {ex.submit(ask_jev, case): case for case in todo}
         for fut in as_completed(futs):
-            d = futs[fut]
+            case = futs[fut]
             try:
                 v, cached = fut.result()
-                answers.append((d, v, cached))
+                answers.append((case, v, cached))
                 score = jev_score(v)  # the score formula may change; the cached answers do not
-                d.verdict = {"jev_score": score, "jev": {k: v[k] for k in ("matches", "own", "kind", "kind_p")},
+                case.verdict = {"jev_score": score, "jev": {k: v[k] for k in ("matches", "own", "kind", "kind_p")},
                              "kind": v["kind"], "_cost": v.get("_cost", 0)}
-                d.stage = "jev" + ("+cache" if cached else "")
-                d.decision = "drop" if score < drop_at else "keep" if trust_jev and score >= keep_at else ""
-                d.why = f"Jev: kind {v['kind']}, match {v['matches']:.2f}, own {v['own']:.2f}"
+                case.stage = "jev" + ("+cache" if cached else "")
+                case.decision = "drop" if score < drop_at else "keep" if trust_jev and score >= keep_at else ""
+                case.why = f"Jev: kind {v['kind']}, match {v['matches']:.2f}, own {v['own']:.2f}"
             except Exception as e:
-                d.stage, d.decision, d.why = "jev", "error", str(e)[:300]
+                case.stage, case.decision, case.why = "jev", "error", str(e)[:300]
             done += 1
             if done % 50 == 0 or done == len(todo):
                 log(f"    jev: {done}/{len(todo)}  spent ${api.spent:.4f}")
@@ -431,9 +500,9 @@ def jev_filter(criteria: str, root: Path, out: Path, *,
             stats = {**last, "summary": last["summary"].split(" [")[0] + " [timed on the last fresh run; this run answered from cache]"}
     prior.write_text(json.dumps(stats, indent=1) + "\n")
     log("    " + stats["summary"])
-    survivors = [d for d in todo if d.decision == ""]
-    log(f"[1] Jev: dropped {sum(d.decision == 'drop' for d in todo)}, "
-        f"kept unread {sum(d.decision == 'keep' for d in todo)}, {len(survivors)} go to the judge")
+    survivors = [case for case in todo if case.decision == ""]
+    log(f"[1] Jev: dropped {sum(case.decision == 'drop' for case in todo)}, "
+        f"kept unread {sum(case.decision == 'keep' for case in todo)}, {len(survivors)} go to the judge")
 
     # ---- stage 2: Claude as judge, through files
     jdir = out / "judge" / crit_hash
@@ -441,28 +510,28 @@ def jev_filter(criteria: str, root: Path, out: Path, *,
     (jdir / "criteria.txt").write_text(criteria.strip() + "\n")
     verdicts = read_judgements(jdir, log)
     pending = []
-    for d in survivors:
-        j = verdicts.get(d.sha)
+    for case in survivors:
+        j = verdicts.get(case.source.full_sha)
         if j:
-            d.verdict.update({k: j[k] for k in ("kind", "authorship", "finished", "languages") if k in j})
-            d.verdict["judge"] = j["decision"]
-            d.verdict["judge_sure"] = j.get("sure", True)
-            d.stage, d.decision, d.why = "judge", j["decision"], j.get("reason", "")
+            case.verdict.update({k: j[k] for k in ("kind", "authorship", "finished", "languages") if k in j})
+            case.verdict["judge"] = j["decision"]
+            case.verdict["judge_sure"] = j.get("sure", True)
+            case.stage, case.decision, case.why = "judge", j["decision"], j.get("reason", "")
         else:
-            pending.append(d)
-            d.stage, d.decision, d.why = "judge", "pending", "waiting for the judge"
-    queues = write_queue(pending, jdir, root, batch_words, batch_files)
+            pending.append(case)
+            case.stage, case.decision, case.why = "judge", "pending", "waiting for the judge"
+    queues = write_queue(pending, jdir, batch_words, batch_files)
     log(f"[2] judge: {len(survivors) - len(pending)} verdicts read back, {len(pending)} pending"
         + (f" in {len(queues)} queue files: {jdir}/queue_*.jsonl" if queues else ""))
 
-    apply_overrides(docs, overrides or out / "overrides.txt", log)
-    _write_outputs(docs, out, criteria, api, copy_selected=copy_selected, root=root, stats=stats)
-    kept = sum(d.decision == "keep" for d in docs)
-    log(f"done: {kept} kept, {len(pending)} pending of {len(docs)}; {api.calls} Jev calls, ${api.spent:.4f}; see {out}/report.md")
-    return docs
+    apply_overrides(cases, overrides or out / "overrides.txt", log)
+    _write_outputs(cases, out, criteria, api, copy_selected=copy_selected, stats=stats)
+    kept = sum(case.decision == "keep" for case in cases)
+    log(f"done: {kept} kept, {len(pending)} pending of {len(cases)}; {api.calls} Jev calls, ${api.spent:.4f}; see {out}/report.md")
+    return cases
 
 
-def jev_stats(answers: list[tuple[Doc, dict, bool]], wall_s: float, workers: int, drop_at: float) -> dict:
+def jev_stats(answers: list[tuple[Case, dict, bool]], wall_s: float, workers: int, drop_at: float) -> dict:
     """How long Jev took to decide, on how many documents, on how much data. Wall time is this run's
     (cache hits cost ~0 s); latency and tokens come from each call, cached ones included."""
     def pct(xs: list[float], q: float) -> float | None:
@@ -471,7 +540,7 @@ def jev_stats(answers: list[tuple[Doc, dict, bool]], wall_s: float, workers: int
     fresh = [v for _, v, c in answers if not c]
     lat = [v["_latency_s"] for _, v, _ in answers if v.get("_latency_s") is not None]
     tok = [v.get("_input_tokens") or round(v.get("_cost", 0) / 0.042e-6) for _, v, _ in answers]
-    words = sum(d.feats["words"] for d, _, _ in answers)
+    words = sum(case.source.features["words"] for case, _, _ in answers)
     chars = sum(v.get("_state_chars") or 0 for _, v, _ in answers)
     dropped = sum(jev_score(v) < drop_at for _, v, _ in answers)
     st = {
@@ -483,7 +552,7 @@ def jev_stats(answers: list[tuple[Doc, dict, bool]], wall_s: float, workers: int
         "input_tokens": sum(tok), "excerpt_chars": chars, "document_words": words,
         "cost_usd": round(sum(v.get("_cost", 0) for _, v, _ in answers), 4),
     }
-    st["summary"] = (f"Jev decided {st['documents']} docs ({st['fresh_calls']} fresh, {st['cached']} cached) in {st['wall_seconds']} s"
+    st["summary"] = (f"Jev decided {st['documents']} cases ({st['fresh_calls']} fresh, {st['cached']} cached) in {st['wall_seconds']} s"
                      f" with {workers} workers; dropped {dropped} ({st['dropped_share']:.0%}); read {st['input_tokens'] / 1000:.0f}k tokens"
                      f" of excerpts from {words / 1000:.0f}k words of documents; latency median {st['latency_s']['median']} s,"
                      f" p95 {st['latency_s']['p95']} s; ${st['cost_usd']:.4f}")
@@ -491,7 +560,7 @@ def jev_stats(answers: list[tuple[Doc, dict, bool]], wall_s: float, workers: int
 
 
 def read_judgements(jdir: Path, log) -> dict[str, dict]:
-    """Verdicts the judge wrote, keyed by content hash: a file judged once stays judged until it changes."""
+    """Verdicts the judge wrote, keyed by the hash of the text it read: a file judged once stays judged until it changes."""
     out: dict[str, dict] = {}
     for f in sorted(jdir.glob("*.verdicts.jsonl")):
         for n, line in enumerate(f.read_text().splitlines(), 1):
@@ -507,28 +576,25 @@ def read_judgements(jdir: Path, log) -> dict[str, dict]:
     return out
 
 
-def write_queue(pending: list[Doc], jdir: Path, root: Path, batch_words: int, batch_files: int) -> list[Path]:
-    """Split the pending files into batches of similar reading load; one subagent judges one batch."""
+def write_queue(pending: list[Case], jdir: Path, batch_words: int, batch_files: int) -> list[Path]:
+    """Split the pending files into batches of similar reading load, counted on the text the judge reads;
+    one subagent judges one batch."""
     for old in jdir.glob("queue_*.jsonl"):
         if re.fullmatch(r"queue_\d+\.jsonl", old.name):  # never the judge's queue_NN.verdicts.jsonl
             old.unlink()
     texts = jdir / "text"
     batches: list[list[dict]] = [[]]
     load = 0
-    for d in sorted(pending, key=lambda d: d.rel):
-        if d.ext in (".md", ".markdown", ".txt"):
-            path = root / d.rel
-        else:  # PDF, DOCX, EPUB: the judge reads the extracted text
-            texts.mkdir(exist_ok=True)
-            path = texts / f"{d.sha[:16]}.md"
-            path.write_text(d.text)
-        item = {"sha": d.sha, "rel": d.rel, "path": str(path), "words": d.feats["words"],
-                "jev": {k: round(v, 2) if isinstance(v, float) else v for k, v in d.verdict["jev"].items() if k != "kind_p"}}
-        if batches[-1] and (load + d.feats["words"] > batch_words or len(batches[-1]) >= batch_files):
+    for case in sorted(pending, key=lambda case: case.rel):
+        src = case.source
+        words = len(src.full_text().split())
+        item = {"sha": src.full_sha, "rel": src.rel, "path": str(src.judge_path(texts)), "words": words,
+                "jev": {k: round(v, 2) if isinstance(v, float) else v for k, v in case.verdict["jev"].items() if k != "kind_p"}}
+        if batches[-1] and (load + words > batch_words or len(batches[-1]) >= batch_files):
             batches.append([])
             load = 0
         batches[-1].append(item)
-        load += d.feats["words"]
+        load += words
     paths = []
     for i, b in enumerate(x for x in batches if x):
         q = jdir / f"queue_{i + 1:02d}.jsonl"
@@ -537,22 +603,22 @@ def write_queue(pending: list[Doc], jdir: Path, root: Path, batch_words: int, ba
     return paths
 
 
-def apply_overrides(docs: list[Doc], path: Path, log) -> None:
+def apply_overrides(cases: list[Case], path: Path, log) -> None:
     """Human decisions win and survive reruns: lines '+ rel/path' keep, '- rel/path' drop, '#' comments."""
     if not path.exists():
         return
-    by_rel = {d.rel: d for d in docs}
+    by_rel = {case.rel: case for case in cases}
     for line in path.read_text().splitlines():
         line = line.split("  #")[0].strip()
         if len(line) < 3 or line[0] not in "+-":
             continue
-        d = by_rel.get(line[1:].strip())
-        if d is None:
+        case = by_rel.get(line[1:].strip())
+        if case is None:
             log(f"    override: no such file {line[1:].strip()!r}")
             continue
-        d.decision, d.stage = ("keep" if line[0] == "+" else "drop"), "override"
-        d.why = "human override"
-        d.verdict["override"] = d.decision
+        case.decision, case.stage = ("keep" if line[0] == "+" else "drop"), "override"
+        case.why = "human override"
+        case.verdict["override"] = case.decision
 
 
 # ---------------------------------------------------------------- outputs
@@ -594,31 +660,25 @@ Anything that runs the same operation over every document (counting, splitting b
 """
 
 
-def _full_text(d: Doc, root: Path) -> str:
-    """The corpus text: the source itself for markdown, every page for PDFs (Jev saw a sample), else the extraction."""
-    if d.ext in (".md", ".markdown"):
-        return (root / d.rel).read_text(encoding="utf-8", errors="replace")
-    if d.ext == ".pdf":
-        return _pdf(root / d.rel, max_pages=None)[0]
-    return d.text
-
-
-def _corpus_record(d: Doc, root: Path, file: str, text: str) -> dict:
-    v = d.verdict if "judge" in d.verdict else {"jev_score": d.verdict.get("jev_score")}  # labels only from the judge
+def _corpus_record(case: Case, file: str, text: str) -> dict:
+    v = case.verdict if "judge" in case.verdict else {"jev_score": case.verdict.get("jev_score")}  # labels only from the judge
     langs = v.get("languages") or []
     if isinstance(langs, str):
         langs = [x.strip() for x in langs.split(",") if x.strip()]
-    return {"id": d.sha, "rel": d.rel, "source": str((root / d.rel).resolve()), "file": file,
+    return {"id": case.source.id, "rel": case.rel, "source": str(case.source.path.resolve()), "file": file,
             "kind": v.get("kind"), "authorship": v.get("authorship"), "finished": v.get("finished"),
-            "languages": langs, "words": d.feats.get("words"), "jev_score": v.get("jev_score"),
-            "decided_by": d.stage.split("+")[0], "reason": d.why, "text": text}
+            "languages": langs, "words": case.source.features.get("words"), "jev_score": v.get("jev_score"),
+            "decided_by": case.stage.split("+")[0], "reason": case.why, "text": text}
 
 
-def _write_outputs(docs: list[Doc], out: Path, criteria: str, api: JevClient | None, *, copy_selected: bool, root: Path,
+def _write_outputs(cases: list[Case], out: Path, criteria: str, api: JevClient | None, *, copy_selected: bool,
                    stats: dict | None = None) -> None:
     with (out / "verdicts.jsonl").open("w") as f:
-        for d in docs:
-            rec = {k: v for k, v in asdict(d).items() if k != "text"}
+        for case in cases:
+            src = case.source
+            rec = {"rel": src.rel, "ext": src.ext, "id": src.id, "text_sha": src.text_sha, "pages": src.pages,
+                   "error": src.error, "features": src.features,
+                   "stage": case.stage, "decision": case.decision, "why": case.why, "verdict": case.verdict}
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     cols = ["decision", "stage", "jev_score", "kind", "authorship", "finished", "languages", "words", "path", "why"]
@@ -626,63 +686,63 @@ def _write_outputs(docs: list[Doc], out: Path, criteria: str, api: JevClient | N
         w = csv.writer(f)
         w.writerow(cols)
         order = {"keep": 0, "pending": 1}
-        for d in sorted(docs, key=lambda d: (order.get(d.decision, 2), -(d.verdict.get("jev_score") or 0), d.rel)):
-            v = d.verdict
-            w.writerow([d.decision, d.stage, v.get("jev_score", ""), v.get("kind", ""), v.get("authorship", ""),
-                        v.get("finished", ""), v.get("languages", ""), d.feats.get("words", ""), d.rel, d.why])
+        for case in sorted(cases, key=lambda case: (order.get(case.decision, 2), -(case.verdict.get("jev_score") or 0), case.rel)):
+            v = case.verdict
+            w.writerow([case.decision, case.stage, v.get("jev_score", ""), v.get("kind", ""), v.get("authorship", ""),
+                        v.get("finished", ""), v.get("languages", ""), case.source.features.get("words", ""), case.rel, case.why])
 
     sel = out / "selected"
     if copy_selected:
         if sel.exists():
             shutil.rmtree(sel)
         with (out / "corpus.jsonl").open("w", encoding="utf-8") as f:
-            for d in sorted(docs, key=lambda d: d.rel):
-                if d.decision != "keep":
+            for case in sorted(cases, key=lambda case: case.rel):
+                if case.decision != "keep":
                     continue
-                name = d.rel if d.ext in (".md", ".markdown") else d.rel + ".md"
-                text = _full_text(d, root)
+                name = case.rel if case.source.ext in (".md", ".markdown") else case.rel + ".md"
+                text = case.source.full_text()
                 dest = sel / name
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_text(text, encoding="utf-8")
-                f.write(json.dumps(_corpus_record(d, root, "selected/" + name, text), ensure_ascii=False) + "\n")
+                f.write(json.dumps(_corpus_record(case, "selected/" + name, text), ensure_ascii=False) + "\n")
         (out / "README.md").write_text(OUT_README)
 
-    kept = [d for d in docs if d.decision == "keep"]
-    pending = [d for d in docs if d.decision == "pending"]
-    errors = [d for d in docs if d.decision == "error"]
-    js = lambda d: d.verdict.get("jev_score")
+    kept = [case for case in cases if case.decision == "keep"]
+    pending = [case for case in cases if case.decision == "pending"]
+    errors = [case for case in cases if case.decision == "error"]
+    js = lambda case: case.verdict.get("jev_score")
     # Two independent readers: where they disagree, or the judge was unsure, a human looks.
-    review = [d for d in docs if d.stage == "judge" and d.decision in ("keep", "drop") and (
-        not d.verdict.get("judge_sure", True)
-        or (d.decision == "drop" and (js(d) or 0) >= 0.5)
-        or (d.decision == "keep" and (js(d) or 1) < 0.3))]
-    jev_cost = sum(d.verdict.get("_cost", 0) for d in docs)
+    review = [case for case in cases if case.stage == "judge" and case.decision in ("keep", "drop") and (
+        not case.verdict.get("judge_sure", True)
+        or (case.decision == "drop" and (js(case) or 0) >= 0.5)
+        or (case.decision == "keep" and (js(case) or 1) < 0.3))]
+    jev_cost = sum(case.verdict.get("_cost", 0) for case in cases)
     lines = [
         "# JEV filter report", "",
         f"Criteria: {criteria.strip()}", "",
-        f"Files: {len(docs)} · kept {len(kept)} · pending judge {len(pending)} · dropped {sum(d.decision == 'drop' for d in docs)} · duplicates {sum(d.decision == 'dup' for d in docs)} · errors {len(errors)}",
-        f"Settled locally (free): {sum(d.stage == 'local' for d in docs)} · dropped by Jev: {sum(d.stage.startswith('jev') and d.decision == 'drop' for d in docs)} · read by the judge: {sum(d.stage == 'judge' for d in docs)} · overridden: {sum(d.stage == 'override' for d in docs)}",
+        f"Files: {len(cases)} · kept {len(kept)} · pending judge {len(pending)} · dropped {sum(case.decision == 'drop' for case in cases)} · duplicates {sum(case.decision == 'dup' for case in cases)} · errors {len(errors)}",
+        f"Settled locally (free): {sum(case.stage == 'local' for case in cases)} · dropped by Jev: {sum(case.stage.startswith('jev') and case.decision == 'drop' for case in cases)} · read by the judge: {sum(case.stage == 'judge' for case in cases)} · overridden: {sum(case.stage == 'override' for case in cases)}",
         f"Jev: {api.calls if api else 0} calls this run, ${api.spent if api else 0:.4f} · all Jev answers incl. cached: ${jev_cost:.4f}",
         *([f"Jev performance: {stats['summary']}"] if stats else []),
         "", f"Kept by kind: {_count(kept, 'kind')}", f"Kept by language: {_count(kept, 'languages')}",
-        f"Kept words: {sum(d.feats['words'] for d in kept)}", "",
+        f"Kept words: {sum(case.source.features['words'] for case in kept)}", "",
         "## Review: the judge was unsure, or Jev and the judge disagree", "",
         "| Jev | judge | kind | path | why |", "|---|---|---|---|---|"]
-    for d in sorted(review, key=lambda d: d.rel):
-        lines.append(f"| {js(d):.2f} | {d.decision}{'' if d.verdict.get('judge_sure', True) else ' (unsure)'} | {d.verdict.get('kind', '?')} | {d.rel} | {d.why} |")
+    for case in sorted(review, key=lambda case: case.rel):
+        lines.append(f"| {js(case):.2f} | {case.decision}{'' if case.verdict.get('judge_sure', True) else ' (unsure)'} | {case.verdict.get('kind', '?')} | {case.rel} | {case.why} |")
     lines += ["", "## Kept", "", "| Jev | kind | fin. | lang | words | path |", "|---|---|---|---|---|---|"]
-    for d in sorted(kept, key=lambda d: d.rel):
-        v = d.verdict
-        lines.append(f"| {'' if js(d) is None else f'{js(d):.2f}'} | {v.get('kind', '?')} | {str(v.get('finished', '?'))[:5]} | {v.get('languages', '?')} | {d.feats['words']} | {d.rel} |")
+    for case in sorted(kept, key=lambda case: case.rel):
+        v = case.verdict
+        lines.append(f"| {'' if js(case) is None else f'{js(case):.2f}'} | {v.get('kind', '?')} | {str(v.get('finished', '?'))[:5]} | {v.get('languages', '?')} | {case.source.features['words']} | {case.rel} |")
     if errors:
-        lines += ["", "## Errors", ""] + [f"- {d.rel}: {d.why}" for d in errors]
+        lines += ["", "## Errors", ""] + [f"- {case.rel}: {case.why}" for case in errors]
     (out / "report.md").write_text("\n".join(lines) + "\n")
 
 
-def _count(docs: list[Doc], key: str) -> str:
+def _count(cases: list[Case], key: str) -> str:
     c: dict[str, int] = {}
-    for d in docs:
-        k = str(d.verdict.get(key, "?")).split(",")[0].strip()
+    for case in cases:
+        k = str(case.verdict.get(key, "?")).split(",")[0].strip()
         c[k] = c.get(k, 0) + 1
     return ", ".join(f"{k} {n}" for k, n in sorted(c.items(), key=lambda x: -x[1]))
 
