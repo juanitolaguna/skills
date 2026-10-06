@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import hashlib
 import html
+import inspect
 import json
 import logging
 import os
@@ -177,11 +179,12 @@ class SourceDoc:
     features: dict = field(default_factory=dict)
     pages: int | None = None
     error: str = ""          # why nothing is readable; text and full text are then ''
+    text_cache: Path | None = field(default=None, repr=False)  # where extracted full texts are kept between runs
     _full: str | None = field(default=None, repr=False)
     _full_sha: str | None = field(default=None, repr=False)
 
     @classmethod
-    def read(cls, root: Path, path: Path) -> SourceDoc:
+    def read(cls, root: Path, path: Path, text_cache: Path | None = None) -> SourceDoc:
         """Never raises: an unreadable file comes back with `error` set."""
         ext = path.suffix.lower()
         extra: dict
@@ -196,26 +199,41 @@ class SourceDoc:
         return cls(rel=path.relative_to(root).as_posix(), path=path, ext=ext,
                    id="" if source is None else hashlib.sha256(source).hexdigest(), text=text,
                    text_sha=hashlib.sha256(" ".join(text.split()).encode()).hexdigest(),
-                   features=features(raw, text), pages=extra.get("pages"), error=extra.get("error", ""))
+                   features=features(raw, text), pages=extra.get("pages"), error=extra.get("error", ""),
+                   text_cache=text_cache)
 
     def excerpt(self, budget: int) -> str:
         """What Jev reads of the cheap view."""
         return excerpt(self.text, budget)
 
     def full_text(self) -> str:
-        """The whole document, as the judge reads it and the corpus stores it; extracted on first ask."""
+        """The whole document, as the judge reads it and the corpus stores it; extracted on first ask,
+        and kept in `text_cache` when one is given."""
         if self._full is None:
+            cached = self._cached_file()
             if self.error:
                 self._full = ""
             elif self.ext in SOURCE_IS_TEXT:
                 self._full = self.path.read_text(encoding="utf-8", errors="replace")
-            elif self.ext == ".pdf":
-                self._full = _pdf(self.path, max_pages=None)[0]
-            elif self.ext == ".epub":
-                self._full = _epub(self.path, limit=None)
-            else:  # DOCX, HTML: the extraction is already whole
-                self._full = self.text
+            elif cached and cached.exists():
+                self._full = cached.read_bytes().decode("utf-8")
+            else:
+                if self.ext == ".pdf":
+                    self._full = _pdf(self.path, max_pages=None)[0]
+                elif self.ext == ".epub":
+                    self._full = _epub(self.path, limit=None)
+                else:  # DOCX, HTML: the extraction is already whole
+                    self._full = self.text
+                if cached:
+                    cached.parent.mkdir(parents=True, exist_ok=True)
+                    cached.write_bytes(self._full.encode("utf-8"))
         return self._full
+
+    def _cached_file(self) -> Path | None:
+        """Keyed by what produced the text: the source bytes, the extraction code and the pypdf version."""
+        if self.text_cache is None or self.error or self.ext in SOURCE_IS_TEXT:
+            return None
+        return self.text_cache / f"{hashlib.sha256((self.id + _extraction_key()).encode()).hexdigest()[:32]}.md"
 
     @property
     def full_sha(self) -> str:
@@ -224,14 +242,27 @@ class SourceDoc:
             self._full_sha = hashlib.sha256(self.full_text().encode()).hexdigest()
         return self._full_sha
 
-    def judge_path(self, text_dir: Path) -> Path:
-        """The file the judge opens: the source itself when it is text, else the full text written to `text_dir`."""
+    def judge_path(self) -> Path:
+        """The file the judge opens: the source itself when it is text, else the full text in the text cache."""
         if self.ext in SOURCE_IS_TEXT:
             return self.path
-        text_dir.mkdir(parents=True, exist_ok=True)
-        path = text_dir / f"{self.full_sha[:16]}.md"
-        path.write_text(self.full_text(), encoding="utf-8")
-        return path
+        cached = self._cached_file()
+        if cached is None:
+            raise ValueError(f"{self.rel}: the judge needs a text cache to read a {self.ext} file")
+        self.full_text()
+        return cached
+
+
+@functools.cache
+def _extraction_key() -> str:
+    """Changes whenever the full text of a PDF, EPUB, DOCX or HTML file could change."""
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        pypdf = version("pypdf")
+    except PackageNotFoundError:
+        pypdf = "none"
+    code = "".join(inspect.getsource(f) for f in (extract, _pdf, _epub, _docx, _strip_html, SourceDoc.full_text))
+    return hashlib.sha256((code + pypdf).encode()).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------- features
@@ -433,7 +464,7 @@ def jev_filter(criteria: str, root: Path, out: Path, *,
     cases: list[Case] = []
     seen: dict[str, Case] = {}
     for p in paths:
-        case = Case(SourceDoc.read(root, p))
+        case = Case(SourceDoc.read(root, p, text_cache=out / ".text_cache"))
         src = case.source
         cases.append(case)
         if src.error:
@@ -582,13 +613,12 @@ def write_queue(pending: list[Case], jdir: Path, batch_words: int, batch_files: 
     for old in jdir.glob("queue_*.jsonl"):
         if re.fullmatch(r"queue_\d+\.jsonl", old.name):  # never the judge's queue_NN.verdicts.jsonl
             old.unlink()
-    texts = jdir / "text"
     batches: list[list[dict]] = [[]]
     load = 0
     for case in sorted(pending, key=lambda case: case.rel):
         src = case.source
         words = len(src.full_text().split())
-        item = {"sha": src.full_sha, "rel": src.rel, "path": str(src.judge_path(texts)), "words": words,
+        item = {"sha": src.full_sha, "rel": src.rel, "path": str(src.judge_path()), "words": words,
                 "jev": {k: round(v, 2) if isinstance(v, float) else v for k, v in case.verdict["jev"].items() if k != "kind_p"}}
         if batches[-1] and (load + words > batch_words or len(batches[-1]) >= batch_files):
             batches.append([])

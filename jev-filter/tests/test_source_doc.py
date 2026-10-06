@@ -1,6 +1,7 @@
 """The Source document: one file read once, with one text per reader."""
 import hashlib
 
+import jev_filter as jf
 from jev_filter import SourceDoc
 
 
@@ -100,23 +101,56 @@ def test_the_same_text_as_md_and_txt_has_one_text_sha(tmp_path):
 def test_the_judge_reads_markdown_where_it_is(tmp_path):
     (tmp_path / "a.md").write_text("words\n")
 
-    src = SourceDoc.read(tmp_path, tmp_path / "a.md")
+    src = SourceDoc.read(tmp_path, tmp_path / "a.md", text_cache=tmp_path / "cache")
 
-    assert src.judge_path(tmp_path / "text") == tmp_path / "a.md"
-    assert not (tmp_path / "text").exists()
+    assert src.judge_path() == tmp_path / "a.md"
+    assert not (tmp_path / "cache").exists()
 
 
-def test_the_judge_reads_every_page_of_a_pdf_and_its_verdict_key_follows_them(tmp_path):
+def test_the_judge_reads_every_page_of_a_pdf_from_the_text_cache(tmp_path):
     from conftest import page_markers, write_pdf
 
     write_pdf(tmp_path / "book.pdf", pages=12)
-    src = SourceDoc.read(tmp_path, tmp_path / "book.pdf")
+    src = SourceDoc.read(tmp_path, tmp_path / "book.pdf", text_cache=tmp_path / "cache")
 
-    path = src.judge_path(tmp_path / "text")
+    path = src.judge_path()
 
-    assert path.parent == tmp_path / "text"
+    assert path.parent == tmp_path / "cache"
     assert page_markers(path.read_text()) == [f"PAGE{n:02d}" for n in range(1, 13)]
     assert src.full_sha == hashlib.sha256(path.read_text().encode()).hexdigest()
+
+
+def test_a_cached_pdf_is_not_extracted_again(tmp_path, monkeypatch):
+    from conftest import page_markers, write_pdf
+
+    write_pdf(tmp_path / "book.pdf", pages=12)
+    SourceDoc.read(tmp_path, tmp_path / "book.pdf", text_cache=tmp_path / "cache").full_text()
+    src = SourceDoc.read(tmp_path, tmp_path / "book.pdf", text_cache=tmp_path / "cache")
+
+    def no_full_extraction(path, max_pages=6):
+        assert max_pages is not None, "full text extracted again"
+        return real_pdf(path, max_pages)
+
+    real_pdf = jf._pdf
+    monkeypatch.setattr(jf, "_pdf", no_full_extraction)
+
+    assert page_markers(src.full_text()) == [f"PAGE{n:02d}" for n in range(1, 13)]
+
+
+def test_changed_extraction_code_extracts_again(tmp_path, monkeypatch):
+    from conftest import write_pdf
+
+    write_pdf(tmp_path / "book.pdf", pages=8)
+    first = SourceDoc.read(tmp_path, tmp_path / "book.pdf", text_cache=tmp_path / "cache")
+    first.full_text()
+    monkeypatch.setattr(jf, "_extraction_key", lambda: "changed extraction code")
+    calls = []
+    real_pdf = jf._pdf
+    monkeypatch.setattr(jf, "_pdf", lambda path, max_pages=6: calls.append(max_pages) or real_pdf(path, max_pages))
+
+    SourceDoc.read(tmp_path, tmp_path / "book.pdf", text_cache=tmp_path / "cache").full_text()
+
+    assert None in calls
 
 
 def test_docx_text_is_its_paragraphs(tmp_path):

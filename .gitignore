@@ -1,0 +1,13 @@
+# Secrets: jev_filter.py looks for this key file in the working directory and its parents
+.openrouter_jev
+.env
+
+# Python and tool caches
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+
+# macOS
+.DS_Store
